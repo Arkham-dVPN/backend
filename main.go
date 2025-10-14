@@ -1,10 +1,8 @@
-
 package main
 
 import (
-	"bufio"
 	"context"
-	"fmt"
+	"encoding/json"
 	"log"
 	"sync"
 	"time"
@@ -13,6 +11,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 
 	kaddht "github.com/libp2p/go-libp2p-kad-dht"
 	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
@@ -21,92 +20,133 @@ import (
 )
 
 const (
-	ProtocolMDNS = "arkham-vpn-local"
-	ProtocolDHT  = "arkham-vpn-global"
+	ProtocolMDNS   = "arkham-vpn-local"
+	ProtocolDHT    = "arkham-vpn-global"
 	ProtocolStream = "/arkham/vpn/1.0.0"
 )
 
-// peerHandler handles the logic for connecting to a newly discovered peer.
-// It's designed to be safe to call from multiple goroutines.
+// VPNRequest is sent by the Seeker to the Warden
+type VPNRequest struct {
+	SeekerPublicKey string `json:"seeker_public_key"`
+}
+
+// VPNResponse is sent by the Warden back to the Seeker
+type VPNResponse struct {
+	WardenPublicKey string `json:"warden_public_key"`
+}
+
+// peerHandler is the logic for connecting to a newly discovered peer (as a Seeker).
 func peerHandler(h host.Host, pi peer.AddrInfo) {
 	if pi.ID == h.ID() {
 		return // Don't connect to ourselves
 	}
 
-	// Use a mutex to prevent race conditions when connecting to the same peer from different discovery methods.
-	// A more robust solution might use a map with mutexes per peer ID.
 	var mu sync.Mutex
 	mu.Lock()
 	defer mu.Unlock()
 
-	// Check if we are already connected to this peer.
 	if h.Network().Connectedness(pi.ID) == network.Connected {
-		log.Printf("Already connected to %s", pi.ID)
-		return
+		return // Already connected or have a pending connection
 	}
 
-	log.Printf("Connecting to peer: %s", pi.ID)
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	log.Printf("[SEEKER] Found potential Warden: %s. Attempting to connect...", pi.ID)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	if err := h.Connect(ctx, pi); err != nil {
-		log.Printf("Failed to connect to peer %s: %v", pi.ID, err)
+		log.Printf("[SEEKER] Failed to connect to %s: %v", pi.ID, err)
 		return
 	}
 
-	log.Printf("Successfully connected to peer: %s", pi.ID)
+	log.Printf("[SEEKER] Connection established to %s. Negotiating tunnel...", pi.ID)
 
-	// Open a stream for communication.
+	// 1. Generate our own WireGuard key pair
+	seekerPrivKey, err := wgtypes.GeneratePrivateKey()
+	if err != nil {
+		log.Printf("[SEEKER] Failed to generate WireGuard private key: %v", err)
+		return
+	}
+	seekerPubKey := seekerPrivKey.PublicKey().String()
+
+	// 2. Open a stream to the Warden to send our public key
 	stream, err := h.NewStream(ctx, pi.ID, ProtocolStream)
 	if err != nil {
-		log.Printf("Failed to open stream to peer %s: %v", pi.ID, err)
+		log.Printf("[SEEKER] Failed to open stream to %s: %v", pi.ID, err)
 		return
 	}
 
-	log.Printf("Opened stream to peer: %s", pi.ID)
-	msg := fmt.Sprintf("Hello from %s!\n", h.ID().String())
-	_, _ = stream.Write([]byte(msg))
+	// 3. Create and send the VPNRequest
+	req := VPNRequest{SeekerPublicKey: seekerPubKey}
+	encoder := json.NewEncoder(stream)
+	if err := encoder.Encode(req); err != nil {
+		log.Printf("[SEEKER] Failed to send request to %s: %v", pi.ID, err)
+		_ = stream.Reset()
+		return
+	}
 
-	reader := bufio.NewReader(stream)
-	response, _ := reader.ReadString('\n')
-	log.Printf("Received response: %s", response)
+	// 4. Wait for the Warden's response
+	decoder := json.NewDecoder(stream)
+	var resp VPNResponse
+	if err := decoder.Decode(&resp); err != nil {
+		log.Printf("[SEEKER] Failed to receive response from %s: %v", pi.ID, err)
+		_ = stream.Reset()
+		return
+	}
+
+	log.Printf("✅ [SEEKER] VPN Tunnel negotiated with Warden %s!", pi.ID)
+	log.Printf("  - My Private Key: %s", seekerPrivKey.String())
+	log.Printf("  - My Public Key: %s", seekerPubKey)
+	log.Printf("  - Warden Public Key: %s", resp.WardenPublicKey)
+	log.Println("  --- Configuration would be applied to local WireGuard interface --- ")
+
 	_ = stream.Close()
 }
 
-// discoveryNotifee gets notified when we find a peer via mDNS.
-type discoveryNotifee struct {
-	h host.Host
-}
-
-// HandlePeerFound is the mDNS discovery handler.
-func (n *discoveryNotifee) HandlePeerFound(pi peer.AddrInfo) {
-	log.Printf("Found peer via mDNS: %s", pi.ID.String())
-	peerHandler(n.h, pi)
-}
-
-// streamHandler handles incoming streams.
+// streamHandler handles incoming VPN requests (as a Warden).
 func streamHandler(s network.Stream) {
 	remotePeer := s.Conn().RemotePeer()
-	log.Printf("Received stream from peer: %s", remotePeer)
+	log.Printf("[WARDEN] Received VPN request from Seeker: %s", remotePeer)
 
-	reader := bufio.NewReader(s)
-	msg, err := reader.ReadString('\n')
-	if err != nil {
-		log.Printf("Error reading from stream: %v", err)
+	// 1. Decode the Seeker's request
+	decoder := json.NewDecoder(s)
+	var req VPNRequest
+	if err := decoder.Decode(&req); err != nil {
+		log.Printf("[WARDEN] Failed to decode request from %s: %v", remotePeer, err)
 		_ = s.Reset()
 		return
 	}
-	log.Printf("Received message: %s", msg)
+	log.Printf("[WARDEN] Received public key from Seeker: %s", req.SeekerPublicKey)
 
-	response := fmt.Sprintf("Message received by %s!\n", s.Conn().LocalPeer().String())
-	_, _ = s.Write([]byte(response))
+	// 2. Generate our own WireGuard key pair
+	wardenPrivKey, err := wgtypes.GeneratePrivateKey()
+	if err != nil {
+		log.Printf("[WARDEN] Failed to generate WireGuard key: %v", err)
+		_ = s.Reset()
+		return
+	}
+	wardenPubKey := wardenPrivKey.PublicKey().String()
+
+	// 3. Create and send the response
+	resp := VPNResponse{WardenPublicKey: wardenPubKey}
+	encoder := json.NewEncoder(s)
+	if err := encoder.Encode(resp); err != nil {
+		log.Printf("[WARDEN] Failed to send response to %s: %v", remotePeer, err)
+		_ = s.Reset()
+		return
+	}
+
+	log.Printf("✅ [WARDEN] VPN Tunnel negotiated for Seeker %s!", remotePeer)
+	log.Printf("  - My Private Key: %s", wardenPrivKey.String())
+	log.Printf("  - My Public Key: %s", wardenPubKey)
+	log.Printf("  - Seeker Public Key: %s", req.SeekerPublicKey)
+	log.Println("  --- Configuration would be applied to local WireGuard interface --- ")
+
 	_ = s.Close()
 }
 
 func main() {
 	ctx := context.Background()
 
-	// Create libp2p host.
 	h, err := libp2p.New(
 		libp2p.ListenAddrStrings(
 			"/ip4/0.0.0.0/tcp/0",
@@ -130,7 +170,6 @@ func main() {
 	h.SetStreamHandler(ProtocolStream, streamHandler)
 
 	// --- Setup mDNS for Local Discovery ---
-	log.Println("Setting up local peer discovery (mDNS)...")
 	mdnsService := mdns.NewMdnsService(h, ProtocolMDNS, &discoveryNotifee{h: h})
 	if err := mdnsService.Start(); err != nil {
 		log.Fatalf("Failed to start mDNS service: %v", err)
@@ -138,44 +177,41 @@ func main() {
 	defer mdnsService.Close()
 
 	// --- Setup DHT for Global Discovery ---
-	log.Println("Setting up global peer discovery (DHT)...")
 	kdht, err := kaddht.New(ctx, h)
 	if err != nil {
 		log.Fatalf("Failed to create DHT: %v", err)
 	}
-
-	log.Println("Bootstrapping the DHT...")
 	if err = kdht.Bootstrap(ctx); err != nil {
 		log.Fatalf("Failed to bootstrap DHT: %v", err)
 	}
-
-	// Announce our presence on the DHT
-	log.Println("Announcing ourselves on the DHT...")
 	routingDiscovery := routing.NewRoutingDiscovery(kdht)
 	util.Advertise(ctx, routingDiscovery, ProtocolDHT)
-	log.Println("Successfully announced!")
 
-	// Find peers on the DHT in a background goroutine
 	go func() {
 		for {
-			log.Println("Searching for peers on the DHT...")
 			peerChan, err := routingDiscovery.FindPeers(ctx, ProtocolDHT)
 			if err != nil {
-				log.Printf("Failed to find peers on DHT: %v", err)
 				time.Sleep(1 * time.Minute)
 				continue
 			}
 			for p := range peerChan {
-				log.Printf("Found peer via DHT: %s", p.ID.String())
 				peerHandler(h, p)
 			}
-			// Search again after a delay
 			time.Sleep(1 * time.Minute)
 		}
 	}()
 
-	log.Println("Node is running. Discovering peers via mDNS and DHT.")
-	log.Println("Press Ctrl+C to exit")
-
+	log.Println("Node is running. Press Ctrl+C to exit")
 	select {}
+}
+
+// discoveryNotifee gets notified when we find a peer via mDNS.
+type discoveryNotifee struct {
+	h host.Host
+}
+
+// HandlePeerFound is the mDNS discovery handler.
+func (n *discoveryNotifee) HandlePeerFound(pi peer.AddrInfo) {
+	log.Printf("Found peer via mDNS: %s", pi.ID.String())
+	peerHandler(n.h, pi)
 }

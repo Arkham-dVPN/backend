@@ -7,6 +7,7 @@ toolchain go1.24.9
 require (
 	github.com/libp2p/go-libp2p v0.44.0
 	github.com/libp2p/go-libp2p-kad-dht v0.35.1
+	golang.zx2c4.com/wireguard/wgctrl v0.0.0-20241231184526-a9ab2273dd10
 )
 
 require (
