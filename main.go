@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"os/exec"
+	"sort"
 	"strings"
 	"time"
 
@@ -31,13 +32,19 @@ const (
 	ProtocolMDNS       = "arkham-vpn-local"
 	ProtocolDHT        = "arkham-vpn-global"
 	ProtocolStream     = "/arkham/vpn/1.0.0"
+	ProtocolPing       = "/arkham/ping/1.0.0"
 	WireGuardInterface = "wg0"
 )
 
 // --- Data Structures --- //
 
+type ConnectRequest struct {
+	Hops int `json:"hops"`
+}
+
 type VPNRequest struct {
-	SeekerPublicKey string `json:"seeker_public_key"`
+	SeekerPublicKey string   `json:"seeker_public_key"`
+	Hops            []string `json:"hops,omitempty"`
 }
 
 type VPNResponse struct {
@@ -45,22 +52,63 @@ type VPNResponse struct {
 }
 
 type APIResponse struct {
-	Status          string `json:"status"`
-	Message         string `json:"message"`
-	WardenPeerID    string `json:"warden_peer_id,omitempty"`
-	SeekerPublicKey string `json:"seeker_public_key,omitempty"`
-	WardenPublicKey string `json:"warden_public_key,omitempty"`
+	Status          string   `json:"status"`
+	Message         string   `json:"message"`
+	WardenPeerID    string   `json:"warden_peer_id,omitempty"`
+	SeekerPublicKey string   `json:"seeker_public_key,omitempty"`
+	WardenPublicKey string   `json:"warden_public_key,omitempty"`
+	Path            []string `json:"path,omitempty"`
 }
 
 // PeerInfo holds detailed information about a discovered peer for the API
 type PeerInfo struct {
-	ID    string   `json:"id"`
-	Addrs []string `json:"addrs"`
+	ID      string   `json:"id"`
+	Addrs   []string `json:"addrs"`
+	Latency int64    `json:"latency"` // Latency in milliseconds
 }
 
 // --- P2P Logic --- //
 
-func streamHandler(s network.Stream) {
+func pingHandler(s network.Stream) {
+	defer s.Close()
+	// The ping handler simply reads one byte and closes the stream.
+	// This is enough to establish a round-trip time.
+	buf := make([]byte, 1)
+	_, _ = s.Read(buf)
+}
+
+func measureLatency(ctx context.Context, h host.Host, p peer.ID) {
+	start := time.Now()
+	s, err := h.NewStream(ctx, p, ProtocolPing)
+	if err != nil {
+		h.Peerstore().Put(p, "latency", int64(9999))
+		return
+	}
+	defer s.Close()
+
+	_, err = s.Write([]byte("p"))
+	if err != nil {
+		h.Peerstore().Put(p, "latency", int64(9999))
+		return
+	}
+
+	buf := make([]byte, 1)
+	_, err = s.Read(buf)
+	if err != nil {
+		// Error reading is fine, the stream might be closed already.
+	}
+
+	latency := time.Since(start).Milliseconds()
+	h.Peerstore().Put(p, "latency", latency)
+	log.Printf("Measured latency to %s: %dms", p.String(), latency)
+}
+
+// Warden handles the peer-to-peer logic for serving VPN connections.
+type Warden struct {
+	host host.Host
+}
+
+func (w *Warden) streamHandler(s network.Stream) {
 	remotePeer := s.Conn().RemotePeer()
 	log.Printf("[WARDEN] Received VPN request from Seeker: %s", remotePeer)
 
@@ -70,22 +118,72 @@ func streamHandler(s network.Stream) {
 		_ = s.Reset()
 		return
 	}
+	defer s.Close()
 
-	wardenPrivKey, err := wgtypes.GeneratePrivateKey()
-	if err != nil {
-		log.Printf("[WARDEN] Failed to generate key: %v", err)
-		_ = s.Reset()
-		return
+	// Check if this is an intermediate hop or an exit node
+	if len(req.Hops) > 0 {
+		// Intermediate hop logic
+		nextHopID := req.Hops[0]
+		remainingHops := req.Hops[1:]
+
+		nextHop, err := peer.Decode(nextHopID)
+		if err != nil {
+			log.Printf("[WARDEN] Invalid next hop peer ID: %v", err)
+			return
+		}
+
+		log.Printf("[WARDEN] Acting as intermediate hop, forwarding request to %s", nextHop)
+
+		// Forward the request to the next hop
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		nextStream, err := w.host.NewStream(ctx, nextHop, ProtocolStream)
+		if err != nil {
+			log.Printf("[WARDEN] Failed to open stream to next hop: %v", err)
+			return
+		}
+
+		forwardReq := VPNRequest{
+			SeekerPublicKey: req.SeekerPublicKey, // Forward original seeker's key
+			Hops:            remainingHops,
+		}
+
+		if err := json.NewEncoder(nextStream).Encode(forwardReq); err != nil {
+			log.Printf("[WARDEN] Failed to forward request: %v", err)
+			return
+		}
+
+		// Now, we wait for the response from the end of the chain and forward it back.
+		var resp VPNResponse
+		if err := json.NewDecoder(nextStream).Decode(&resp); err != nil {
+			log.Printf("[WARDEN] Failed to get response from next hop: %v", err)
+			return
+		}
+
+		// Forward the response back to the original seeker
+		if err := json.NewEncoder(s).Encode(resp); err != nil {
+			log.Printf("[WARDEN] Failed to forward response back: %v", err)
+			return
+		}
+		log.Printf("✅ [WARDEN] Intermediate hop for %s -> %s complete.", remotePeer, nextHop)
+
+	} else {
+		// Exit node logic
+		log.Println("[WARDEN] Acting as exit node.")
+		wardenPrivKey, err := wgtypes.GeneratePrivateKey()
+		if err != nil {
+			log.Printf("[WARDEN] Failed to generate key: %v", err)
+			return
+		}
+
+		resp := VPNResponse{WardenPublicKey: wardenPrivKey.PublicKey().String()}
+		if err := json.NewEncoder(s).Encode(resp); err != nil {
+			log.Printf("[WARDEN] Failed to send response: %v", err)
+			return
+		}
+		log.Printf("✅ [WARDEN] Exit node negotiated tunnel for Seeker %s!", remotePeer)
 	}
-
-	resp := VPNResponse{WardenPublicKey: wardenPrivKey.PublicKey().String()}
-	if err := json.NewEncoder(s).Encode(resp); err != nil {
-		log.Printf("[WARDEN] Failed to send response: %v", err)
-		_ = s.Reset()
-		return
-	}
-
-	log.Printf("✅ [WARDEN] VPN Tunnel negotiated for Seeker %s!", remotePeer)
 }
 
 // --- API Handlers --- //
@@ -105,9 +203,19 @@ func peersHandler(w http.ResponseWriter, r *http.Request, h host.Host) {
 			addrStrings[i] = addr.String()
 		}
 
+		// Get latency from peerstore
+		latencyVal, err := h.Peerstore().Get(p, "latency")
+		var latency int64
+		if err == nil {
+			if lat, ok := latencyVal.(int64); ok {
+				latency = lat
+			}
+		}
+
 		peerInfos = append(peerInfos, PeerInfo{
-			ID:    p.String(),
-			Addrs: addrStrings,
+			ID:      p.String(),
+			Addrs:   addrStrings,
+			Latency: latency,
 		})
 	}
 
@@ -116,24 +224,58 @@ func peersHandler(w http.ResponseWriter, r *http.Request, h host.Host) {
 }
 
 func connectHandler(w http.ResponseWriter, r *http.Request, h host.Host) {
-	log.Println("[API] Received /api/connect request")
-
-	var wardenPeer peer.ID
-	if len(h.Peerstore().Peers()) > 1 {
-		for _, p := range h.Peerstore().Peers() {
-			if p != h.ID() {
-				wardenPeer = p
-				break
-			}
+	var connectReq ConnectRequest
+	// Default to 1 hop if body is empty or invalid
+	if r.Body != nil && r.Body != http.NoBody {
+		if err := json.NewDecoder(r.Body).Decode(&connectReq); err != nil {
+			connectReq.Hops = 1
 		}
+	} else {
+		connectReq.Hops = 1
 	}
 
-	if wardenPeer == "" {
-		writeError(w, http.StatusServiceUnavailable, "No available peers found.")
+	if connectReq.Hops <= 0 {
+		connectReq.Hops = 1
+	}
+
+	log.Printf("[API] Received /api/connect request for %d hop(s)", connectReq.Hops)
+
+	// Select peers for the tunnel
+	peers := h.Peerstore().Peers()
+	var availablePeers []peer.ID
+
+	for _, p := range peers {
+		if p == h.ID() {
+			continue
+		}
+		latencyVal, err := h.Peerstore().Get(p, "latency")
+		if err != nil {
+			continue
+		}
+		latency, ok := latencyVal.(int64)
+		if !ok || latency >= 9999 {
+			continue
+		}
+		availablePeers = append(availablePeers, p)
+	}
+
+	if len(availablePeers) < connectReq.Hops {
+		writeError(w, http.StatusServiceUnavailable, fmt.Sprintf("Not enough available peers for %d hops.", connectReq.Hops))
 		return
 	}
 
-	log.Printf("[API] Attempting to negotiate tunnel with %s", wardenPeer)
+	// Sort peers by latency
+	sort.Slice(availablePeers, func(i, j int) bool {
+		latI, _ := h.Peerstore().Get(availablePeers[i], "latency")
+		latJ, _ := h.Peerstore().Get(availablePeers[j], "latency")
+		return latI.(int64) < latJ.(int64)
+	})
+
+	path := availablePeers[:connectReq.Hops]
+	wardenPeer := path[0] // The entry node
+
+	log.Printf("[API] Selected path for %d hops: %v", connectReq.Hops, path)
+	log.Printf("[API] Attempting to negotiate tunnel with entry node %s", wardenPeer)
 
 	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 	defer cancel()
@@ -144,13 +286,23 @@ func connectHandler(w http.ResponseWriter, r *http.Request, h host.Host) {
 		return
 	}
 
+	// Prepare the multi-hop request
+	var hopIDs []string
+	for _, p := range path[1:] { // All hops except the entry node
+		hopIDs = append(hopIDs, p.String())
+	}
+
+	req := VPNRequest{
+		SeekerPublicKey: seekerPrivKey.PublicKey().String(),
+		Hops:            hopIDs,
+	}
+
 	stream, err := h.NewStream(ctx, wardenPeer, ProtocolStream)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to open stream to peer: %v", err))
 		return
 	}
 
-	req := VPNRequest{SeekerPublicKey: seekerPrivKey.PublicKey().String()}
 	if err := json.NewEncoder(stream).Encode(req); err != nil {
 		writeError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to send request: %v", err))
 		return
@@ -162,7 +314,7 @@ func connectHandler(w http.ResponseWriter, r *http.Request, h host.Host) {
 		return
 	}
 
-	log.Printf("✅ [API] Successfully negotiated keys with %s", wardenPeer)
+	log.Printf("✅ [API] Successfully negotiated multi-hop tunnel. Exit node public key received.")
 
 	log.Printf("[API] Applying configuration to local interface '%s'...", WireGuardInterface)
 	if err := configureSeekerInterface(seekerPrivKey, resp.WardenPublicKey, stream.Conn()); err != nil {
@@ -174,20 +326,50 @@ func connectHandler(w http.ResponseWriter, r *http.Request, h host.Host) {
 	log.Printf("✅ [API] Successfully configured WireGuard interface '%s'!", WireGuardInterface)
 
 	w.WriteHeader(http.StatusOK)
+	var pathStrings []string
+	for _, p := range path {
+		pathStrings = append(pathStrings, p.String())
+	}
+
 	_ = json.NewEncoder(w).Encode(APIResponse{
 		Status:          "success",
 		Message:         fmt.Sprintf("WireGuard interface '%s' configured.", WireGuardInterface),
 		WardenPeerID:    wardenPeer.String(),
 		SeekerPublicKey: seekerPrivKey.PublicKey().String(),
 		WardenPublicKey: resp.WardenPublicKey,
+		Path:            pathStrings,
+	})
+}
+
+func disconnectHandler(w http.ResponseWriter, r *http.Request) {
+	log.Println("[API] Received /api/disconnect request")
+
+	// Deleting the interface also removes any DNS settings associated with it by resolvectl.
+	if err := exec.Command("ip", "link", "del", WireGuardInterface).Run(); err != nil {
+		log.Printf("Failed to delete WireGuard interface (it may not exist): %v", err)
+		// Don't write an error, as the interface might already be gone.
+		// The goal is to ensure a disconnected state.
+	}
+
+	log.Printf("✅ Successfully deleted WireGuard interface '%s'", WireGuardInterface)
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(APIResponse{
+		Status:  "success",
+		Message: "WireGuard interface deleted.",
 	})
 }
 
 func configureSeekerInterface(privKey wgtypes.Key, wardenPubKeyStr string, conn network.Conn) error {
-	cmd := exec.Command("ip", "link", "add", WireGuardInterface, "type", "wireguard")
-	if err := cmd.Run(); err != nil {
-		log.Printf("Could not create interface '%s' (it may already exist): %v", WireGuardInterface, err)
+	// Clean up previous interface if it exists
+	if err := exec.Command("ip", "link", "del", WireGuardInterface).Run(); err == nil {
+		log.Printf("Removed existing WireGuard interface '%s'", WireGuardInterface)
 	}
+
+	// Create new WireGuard interface
+	if err := exec.Command("ip", "link", "add", WireGuardInterface, "type", "wireguard").Run(); err != nil {
+		return fmt.Errorf("failed to create wireguard interface: %w", err)
+	}
+	log.Printf("Created WireGuard interface '%s'", WireGuardInterface)
 
 	wgClient, err := wgctrl.New()
 	if err != nil {
@@ -223,7 +405,31 @@ func configureSeekerInterface(privKey wgtypes.Key, wardenPubKeyStr string, conn 
 	}
 
 	log.Printf("Attempting to configure device '%s' with peer %s", WireGuardInterface, wardenPubKey.String())
-	return wgClient.ConfigureDevice(WireGuardInterface, cfg)
+	if err := wgClient.ConfigureDevice(WireGuardInterface, cfg); err != nil {
+		return fmt.Errorf("failed to configure device: %w", err)
+	}
+
+	// Bring the interface up
+	if err := exec.Command("ip", "link", "set", "up", WireGuardInterface).Run(); err != nil {
+		return fmt.Errorf("failed to bring up interface: %w", err)
+	}
+	log.Printf("Brought up interface '%s'", WireGuardInterface)
+
+	// Configure DNS using resolvectl for systemd-resolved
+	dnsServers := []string{"1.1.1.1", "1.0.0.1"}
+	log.Printf("Configuring DNS for interface '%s' with servers: %v", WireGuardInterface, dnsServers)
+	if err := exec.Command("resolvectl", "dns", WireGuardInterface, strings.Join(dnsServers, " ")).Run(); err != nil {
+		log.Printf("Could not set DNS via resolvectl (maybe not installed or not a systemd-resolved system): %v", err)
+		// This is not a fatal error, the tunnel will still work, but DNS might leak.
+	} else {
+		if err := exec.Command("resolvectl", "domain", WireGuardInterface, "~.").Run(); err != nil {
+			log.Printf("Could not set default DNS domain via resolvectl: %v", err)
+		} else {
+			log.Println("✅ DNS configured successfully")
+		}
+	}
+
+	return nil
 }
 
 func writeError(w http.ResponseWriter, code int, message string) {
@@ -244,20 +450,36 @@ func main() {
 	defer h.Close()
 
 	log.Printf("Arkham P2P Node Initialized: %s", h.ID().String())
-	h.SetStreamHandler(ProtocolStream, streamHandler)
+	warden := &Warden{host: h}
+	h.SetStreamHandler(ProtocolStream, warden.streamHandler)
+	h.SetStreamHandler(ProtocolPing, pingHandler)
 
 	go setupDiscovery(h)
 
 	if !*peerOnly {
 		log.Println("Starting API server on :8080...")
-		http.HandleFunc("/api/peers", func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Access-Control-Allow-Origin", "*")
+		apiHandler := func(handler http.HandlerFunc) http.HandlerFunc {
+			return func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Access-Control-Allow-Origin", "*")
+				w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
+				w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+
+				if r.Method == "OPTIONS" {
+					w.WriteHeader(http.StatusOK)
+					return
+				}
+				handler(w, r)
+			}
+		}
+
+		http.HandleFunc("/api/peers", apiHandler(func(w http.ResponseWriter, r *http.Request) {
 			peersHandler(w, r, h)
-		})
-		http.HandleFunc("/api/connect", func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Access-Control-Allow-Origin", "*")
+		}))
+		http.HandleFunc("/api/connect", apiHandler(func(w http.ResponseWriter, r *http.Request) {
 			connectHandler(w, r, h)
-		})
+		}))
+		http.HandleFunc("/api/disconnect", apiHandler(disconnectHandler))
+
 		if err := http.ListenAndServe(":8080", nil); err != nil {
 			log.Fatalf("Failed to start API server: %v", err)
 		}
@@ -293,7 +515,12 @@ func setupDiscovery(h host.Host) {
 			peerChan, _ := routingDiscovery.FindPeers(ctx, ProtocolDHT)
 			for p := range peerChan {
 				if p.ID != h.ID() {
-					h.Peerstore().AddAddrs(p.ID, p.Addrs, time.Hour)
+					// Check if we already have this peer, to avoid re-measuring latency
+					if len(h.Peerstore().Addrs(p.ID)) == 0 {
+						log.Printf("Found peer via DHT: %s", p.ID.String())
+						h.Peerstore().AddAddrs(p.ID, p.Addrs, time.Hour)
+						go measureLatency(context.Background(), h, p.ID)
+					}
 				}
 			}
 			time.Sleep(1 * time.Minute)
@@ -313,4 +540,7 @@ func (n *discoveryNotifee) HandlePeerFound(pi peer.AddrInfo) {
 	}
 	log.Printf("Found peer via mDNS: %s", pi.ID.String())
 	n.h.Peerstore().AddAddrs(pi.ID, pi.Addrs, time.Hour)
+
+	// Measure latency in the background
+	go measureLatency(context.Background(), n.h, pi.ID)
 }
